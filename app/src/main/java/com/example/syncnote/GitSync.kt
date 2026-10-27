@@ -104,6 +104,27 @@ object GitSync {
     ): SyncResult {
         val git = Git.open(targetDir)
         try {
+            // fetch 走 .git/config 里的 origin 地址，不校验就会出现「改了地址仍拉旧仓库」。
+            val config = git.repository.config
+            val origin = config.getString("remote", "origin", "url")
+            when {
+                origin.isNullOrBlank() -> {
+                    config.setString("remote", "origin", "url", url)
+                    config.save()
+                }
+
+                normalizeRepoUrl(origin) != normalizeRepoUrl(url) ->
+                    return SyncResult.Failed(
+                        "该目录已是另一个仓库的副本：\n$origin\n" +
+                            "请换一个目录，或删掉该目录后重新同步。"
+                    )
+
+                origin != url -> {
+                    config.setString("remote", "origin", "url", url)
+                    config.save()
+                }
+            }
+
             onProgress(0, "拉取中")
             val fetch = git.fetch()
                 .setRemote("origin")
@@ -135,6 +156,22 @@ object GitSync {
 
     private fun isGitRepo(dir: File): Boolean =
         dir.isDirectory && File(dir, ".git").exists()
+
+    /**
+     * 归一化后比较，忽略协议、凭据、.git 后缀、结尾斜杠与大小写差异，
+     * 避免把同一个仓库的两种写法误判成两个仓库。
+     *
+     * https://github.com/o/r.git 与 git@github.com:o/r 都归一为 github.com/o/r
+     */
+    private fun normalizeRepoUrl(raw: String): String {
+        var s = raw.trim()
+        s = s.substringAfter("://", s)          // 去掉 https:// 之类协议头
+        s = s.substringAfterLast('@', s)        // 去掉 userinfo（git@ 或 token@）
+        s = s.replace(':', '/')                 // scp 风格 host:owner/repo
+        s = s.trimEnd('/')
+        if (s.endsWith(".git")) s = s.dropLast(4)
+        return s.lowercase()
+    }
 
     /**
      * origin/HEAD 在某些情况下不存在，按 main → master → 字典序第一个
