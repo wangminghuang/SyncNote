@@ -9,9 +9,10 @@ import org.eclipse.jgit.api.errors.InvalidRemoteException
 import org.eclipse.jgit.api.errors.TransportException
 import org.eclipse.jgit.errors.RepositoryNotFoundException
 import org.eclipse.jgit.lib.ProgressMonitor
+import org.eclipse.jgit.transport.CredentialsProvider
 import org.eclipse.jgit.transport.RefSpec
+import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider
 import java.io.File
-import java.net.URI
 import java.net.UnknownHostException
 import javax.net.ssl.SSLException
 import javax.net.ssl.SSLHandshakeException
@@ -31,20 +32,29 @@ object GitSync {
 
     private const val DEFAULT_BRANCH_CANDIDATES = "main,master"
 
+    /**
+     * GitHub 对 HTTPS 的 Basic 认证只校验密码位的 token，用户名任意。
+     * 这里用 x-access-token 是为了兼容 fine-grained token —— 把 token 放在
+     * 用户名位、密码留空的写法只对 classic token 有效，fine-grained 会返回 401。
+     */
+    private const val GITHUB_TOKEN_USER = "x-access-token"
+
     suspend fun sync(
         repoUrl: String,
         token: String?,
         targetDir: File,
         onProgress: (percent: Int, phase: String) -> Unit
     ): SyncResult = withContext(Dispatchers.IO) {
-        val cleanUrl = repoUrl.trim()
-        val authUrl = withToken(cleanUrl, token)
+        val url = repoUrl.trim()
+        val credentials = token
+            ?.takeIf { it.isNotBlank() }
+            ?.let { UsernamePasswordCredentialsProvider(GITHUB_TOKEN_USER, it) }
 
         try {
             if (isGitRepo(targetDir)) {
-                update(authUrl, cleanUrl, targetDir, onProgress)
+                update(url, credentials, targetDir, onProgress)
             } else {
-                clone(authUrl, cleanUrl, targetDir, onProgress)
+                clone(url, credentials, targetDir, onProgress)
             }
         } catch (e: Throwable) {
             SyncResult.Failed(describe(e))
@@ -54,8 +64,8 @@ object GitSync {
     // ---------------------------------------------------------------- clone
 
     private fun clone(
-        authUrl: String,
-        cleanUrl: String,
+        url: String,
+        credentials: CredentialsProvider?,
         targetDir: File,
         onProgress: (Int, String) -> Unit
     ): SyncResult {
@@ -73,22 +83,13 @@ object GitSync {
         }
 
         onProgress(0, "克隆中")
-        val git = Git.cloneRepository()
-            .setURI(authUrl)
+        val command = Git.cloneRepository()
+            .setURI(url)
             .setDirectory(targetDir)
             .setProgressMonitor(ProgressAdapter("克隆中", onProgress))
-            .call()
+        credentials?.let { command.setCredentialsProvider(it) }
 
-        try {
-            // 抹掉 origin 里带 token 的地址，避免 token 明文留在 .git/config
-            if (cleanUrl != authUrl) {
-                val config = git.repository.config
-                config.setString("remote", "origin", "url", cleanUrl)
-                config.save()
-            }
-        } finally {
-            git.close()
-        }
+        command.call().close()
 
         return SyncResult.Success(targetDir, "克隆完成")
     }
@@ -96,20 +97,21 @@ object GitSync {
     // --------------------------------------------------------------- update
 
     private fun update(
-        authUrl: String,
-        cleanUrl: String,
+        url: String,
+        credentials: CredentialsProvider?,
         targetDir: File,
         onProgress: (Int, String) -> Unit
     ): SyncResult {
         val git = Git.open(targetDir)
         try {
             onProgress(0, "拉取中")
-            git.fetch()
-                .setRemote(authUrl)
+            val fetch = git.fetch()
+                .setRemote("origin")
                 .setRefSpecs(RefSpec("+refs/heads/*:refs/remotes/origin/*"))
                 .setRemoveDeletedRefs(true)
                 .setProgressMonitor(ProgressAdapter("拉取中", onProgress))
-                .call()
+            credentials?.let { fetch.setCredentialsProvider(it) }
+            fetch.call()
 
             val branch = resolveDefaultBranch(git)
             onProgress(95, "应用更新")
@@ -122,12 +124,6 @@ object GitSync {
             // 所以 .gitignore 忽略的文件不会被误删。
             runCatching { git.clean().setCleanDirectories(true).call() }
 
-            if (cleanUrl != authUrl) {
-                val config = git.repository.config
-                config.setString("remote", "origin", "url", cleanUrl)
-                config.save()
-            }
-
             onProgress(100, "完成")
             return SyncResult.Success(targetDir, "已更新到最新（$branch）")
         } finally {
@@ -139,21 +135,6 @@ object GitSync {
 
     private fun isGitRepo(dir: File): Boolean =
         dir.isDirectory && File(dir, ".git").exists()
-
-    /**
-     * 支持私有仓库：把 token 拼进 URL 的 userinfo 段。
-     * 请求完成后会在 remote 配置里改回不带 token 的地址。
-     */
-    private fun withToken(repoUrl: String, token: String?): String {
-        if (token.isNullOrBlank()) return repoUrl
-        if (!repoUrl.startsWith("http", ignoreCase = true)) return repoUrl
-        return runCatching {
-            val uri = URI(repoUrl)
-            val host = uri.host ?: return repoUrl
-            val port = if (uri.port > 0) ":${uri.port}" else ""
-            "https://$token@$host$port${uri.rawPath.orEmpty()}"
-        }.getOrDefault(repoUrl)
-    }
 
     /**
      * origin/HEAD 在某些情况下不存在，按 main → master → 字典序第一个
@@ -216,10 +197,16 @@ object GitSync {
             chain.any { it is TransportException } -> {
                 val msg = e.message.orEmpty()
                 val authHint = listOf("not authorized", "authentication", "401", "403", "denied")
-                if (authHint.any { msg.contains(it, ignoreCase = true) }) {
-                    "认证失败：该仓库可能是私有的，请填写有效的 Token"
-                } else {
-                    "网络传输失败：$msg"
+                when {
+                    authHint.any { msg.contains(it, ignoreCase = true) } ->
+                        "认证失败：Token 无效或权限不足。\n" +
+                            "请确认 Token 的 Repository permissions 里 Contents 为 Read，" +
+                            "且 Repository access 包含该仓库。\n原始信息：$msg"
+
+                    msg.contains("not found", ignoreCase = true) ->
+                        "仓库不存在，或 Token 无权访问该仓库（私有仓库会返回 404）。\n原始信息：$msg"
+
+                    else -> "网络传输失败：$msg"
                 }
             }
 
